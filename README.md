@@ -10,6 +10,8 @@ https://github.com/user-attachments/assets/ee4ea6c3-a1ca-47ce-9fe0-537cb69b431f
 
 https://github.com/user-attachments/assets/c3a18739-da55-408e-8903-51757cc6530e
 
+https://github.com/user-attachments/assets/59d71f7b-8892-4457-87cd-9a94043ba287
+
 ## What it does
 
 SCAIL-2 generates at most 81 frames per pass. Longer videos require extension passes where the first 5 frames are anchored to the last 5 frames of the previous chunk, so each extension only contributes 76 new frames — and the final chunk length depends on the input video. Doing this by hand means duplicated node sections, manual bypassing, and recalculating the last chunk for every video.
