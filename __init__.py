@@ -110,7 +110,7 @@ class SCAILAutoExtend:
             add_noise: bool = True,
     ) -> tuple[torch.Tensor, int]:
 
-        # imported here so a missing/changed core module gives a clear error at run time
+        import time
         from comfy_extras.nodes_scail import WanSCAILToVideo
         from comfy_extras.nodes_custom_sampler import SamplerCustom
         from comfy_extras.nodes_post_processing import ColorTransfer
@@ -142,22 +142,28 @@ class SCAILAutoExtend:
             f"{len(lengths)} chunk(s): {lengths}"
         )
 
-        # --- Unified overall progress across every chunk ----------------------
         steps_per_chunk: int = max(1, sigmas.shape[-1] - 1)
         total_steps: int = steps_per_chunk * len(lengths)
         original_hook = comfy.utils.PROGRESS_BAR_HOOK
-        chunk_base: int = 0  # steps completed by chunks before the current one
+        chunk_base: int = 0
 
         def remapped_hook(value: int, total: int, preview=None, **kwargs) -> None:
             if original_hook is not None:
                 global_value = min(chunk_base + value, total_steps)
                 original_hook(global_value, total_steps, preview, **kwargs)
 
-        chunks: list[torch.Tensor] = []          # stitched contributions
-        prev_frames: torch.Tensor | None = None  # full frames of previous chunk's contribution
+        def format_time(seconds: float) -> str:
+            m, s = divmod(int(seconds), 60)
+            h, m = divmod(m, 60)
+            return f"{h:02d}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
+
+        chunks: list[torch.Tensor] = []
+        prev_frames: torch.Tensor | None = None
         offset: int = 0
 
+        start_time: float = time.time()
         comfy.utils.PROGRESS_BAR_HOOK = remapped_hook
+
         try:
             for i, length in enumerate(lengths):
                 comfy.model_management.throw_exception_if_processing_interrupted()
@@ -187,7 +193,7 @@ class SCAILAutoExtend:
                     positive=pos_c, negative=neg_c, sampler=sampler, sigmas=sigmas,
                     latent_image=latent,
                 )
-                denoised: dict = sampled.args[1]  # denoised_output
+                denoised: dict = sampled.args[1]
 
                 images: torch.Tensor = vae.decode(denoised["samples"])
                 if images.ndim == 5:
@@ -210,16 +216,19 @@ class SCAILAutoExtend:
                 chunks.append(contrib)
                 prev_frames = contrib
 
-                # Snap the bar to this chunk's end so completion reads cleanly even
-                # if the sampler's last step rounds short.
                 if original_hook is not None:
                     original_hook(min((i + 1) * steps_per_chunk, total_steps), total_steps, None)
 
+                elapsed_time: float = time.time() - start_time
+                avg_time_per_chunk: float = elapsed_time / (i + 1)
+                remaining_chunks: int = len(lengths) - (i + 1)
+                eta: float = avg_time_per_chunk * remaining_chunks
+
                 print(
-                    f"[SCAIL Auto Extend] chunk {i + 1}/{len(lengths)} done "
+                    f"[SCAIL Auto Extend] ##### chunk {i + 1}/{len(lengths)} done "
                     f"({length} frames, offset now {offset}) -- "
-                    f"{i + 1}/{len(lengths)} chunks "
-                    f"({(i + 1) / len(lengths) * 100:.1f}%)"
+                    f"{(i + 1) / len(lengths) * 100:.1f}% -- "
+                    f"Time: {format_time(elapsed_time)} < {format_time(eta)} #####"
                 )
         finally:
             comfy.utils.PROGRESS_BAR_HOOK = original_hook
