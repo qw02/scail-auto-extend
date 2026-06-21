@@ -65,9 +65,9 @@ class SCAILAutoExtend:
                 "overlap": ("INT", {"default": 5, "min": 1, "max": 81, "step": 4,
                                     "tooltip": "Frames from the previous chunk used as anchor. SCAIL-2 trained at 5."}),
                 "seed_mode": (["increment", "fixed"], {"default": "increment",
-                              "tooltip": "increment: chunk i uses noise_seed+i. fixed: same seed every chunk."}),
+                                                       "tooltip": "increment: chunk i uses noise_seed+i. fixed: same seed every chunk."}),
                 "color_transfer": ("BOOLEAN", {"default": True,
-                                   "tooltip": "Reinhard LAB color match of each extension chunk to the last frame of the previous chunk (fights drift)."}),
+                                               "tooltip": "Reinhard LAB color match of each extension chunk to the last frame of the previous chunk (fights drift)."}),
             },
             "optional": {
                 "pose_video_mask": ("IMAGE",),
@@ -82,12 +82,34 @@ class SCAILAutoExtend:
             },
         }
 
-    def generate(self, model, positive, negative, vae, sampler, sigmas, pose_video,
-                 width, height, noise_seed, cfg, chunk_length, overlap, seed_mode,
-                 color_transfer, pose_video_mask=None, reference_image=None,
-                 reference_image_mask=None, clip_vision_output=None,
-                 replacement_mode=True, pose_strength=1.0, pose_start=0.0,
-                 pose_end=1.0, add_noise=True):
+    def generate(
+            self,
+            model: object,
+            positive: list,
+            negative: list,
+            vae: object,
+            sampler: object,
+            sigmas: torch.Tensor,
+            pose_video: torch.Tensor,
+            width: int,
+            height: int,
+            noise_seed: int,
+            cfg: float,
+            chunk_length: int,
+            overlap: int,
+            seed_mode: str,
+            color_transfer: bool,
+            pose_video_mask: torch.Tensor | None = None,
+            reference_image: torch.Tensor | None = None,
+            reference_image_mask: torch.Tensor | None = None,
+            clip_vision_output: object | None = None,
+            replacement_mode: bool = True,
+            pose_strength: float = 1.0,
+            pose_start: float = 0.0,
+            pose_end: float = 1.0,
+            add_noise: bool = True,
+    ) -> tuple[torch.Tensor, int]:
+
         # imported here so a missing/changed core module gives a clear error at run time
         from comfy_extras.nodes_scail import WanSCAILToVideo
         from comfy_extras.nodes_custom_sampler import SamplerCustom
@@ -97,74 +119,114 @@ class SCAILAutoExtend:
         if overlap % 4 != 1:
             overlap = max(1, ((overlap - 1) // 4) * 4 + 1)
         if chunk_length - overlap < 4:
-            raise ValueError(f"chunk_length ({chunk_length}) must exceed overlap "
-                             f"({overlap}) by at least 4.")
+            raise ValueError(
+                f"chunk_length ({chunk_length}) must exceed overlap "
+                f"({overlap}) by at least 4."
+            )
 
         if width % 32 != 0 or height % 32 != 0:
-            print(f"[SCAIL Auto Extend] WARNING: width/height ({width}x{height}) are not both "
-                  f"multiples of 32. The pose conditioning runs at half resolution, so non-32 "
-                  f"sizes leave its latent odd and the model circular-pads it -- which can copy "
-                  f"the top edge of the frame onto the bottom. Use multiples of 32.")
+            print(
+                f"[SCAIL Auto Extend] WARNING: width/height ({width}x{height}) are not both "
+                f"multiples of 32. The pose conditioning runs at half resolution, so non-32 "
+                f"sizes leave its latent odd and the model circular-pads it -- which can copy "
+                f"the top edge of the frame onto the bottom. Use multiples of 32."
+            )
 
-        n_input = pose_video.shape[0]
+        n_input: int = pose_video.shape[0]
+        n_eff: int
+        lengths: list[int]
         n_eff, lengths = _plan_chunks(n_input, chunk_length, overlap)
-        print(f"[SCAIL Auto Extend] {n_input} pose frames -> {n_eff} output frames, "
-              f"{len(lengths)} chunk(s): {lengths}")
 
-        pbar = comfy.utils.ProgressBar(len(lengths))
-        chunks = []          # stitched contributions
-        prev_frames = None   # full frames of previous chunk's contribution
-        offset = 0
+        print(
+            f"[SCAIL Auto Extend] {n_input} pose frames -> {n_eff} output frames, "
+            f"{len(lengths)} chunk(s): {lengths}"
+        )
 
-        for i, length in enumerate(lengths):
-            comfy.model_management.throw_exception_if_processing_interrupted()
-            seed = noise_seed + i if seed_mode == "increment" else noise_seed
+        # --- Unified overall progress across every chunk ----------------------
+        steps_per_chunk: int = max(1, sigmas.shape[-1] - 1)
+        total_steps: int = steps_per_chunk * len(lengths)
+        original_hook = comfy.utils.PROGRESS_BAR_HOOK
+        chunk_base: int = 0  # steps completed by chunks before the current one
 
-            cond = WanSCAILToVideo.execute(
-                positive=positive, negative=negative, vae=vae,
-                width=width, height=height, length=length, batch_size=1,
-                pose_strength=pose_strength, pose_start=pose_start, pose_end=pose_end,
-                video_frame_offset=offset, previous_frame_count=overlap,
-                replacement_mode=replacement_mode,
-                reference_image=reference_image,
-                clip_vision_output=clip_vision_output,
-                pose_video=pose_video, pose_video_mask=pose_video_mask,
-                reference_image_mask=reference_image_mask,
-                previous_frames=prev_frames,
-            )
-            pos_c, neg_c, latent, offset = cond.args
+        def remapped_hook(value: int, total: int, preview=None, **kwargs) -> None:
+            if original_hook is not None:
+                global_value = min(chunk_base + value, total_steps)
+                original_hook(global_value, total_steps, preview, **kwargs)
 
-            sampled = SamplerCustom.execute(
-                model=model, add_noise=add_noise, noise_seed=seed, cfg=cfg,
-                positive=pos_c, negative=neg_c, sampler=sampler, sigmas=sigmas,
-                latent_image=latent,
-            )
-            denoised = sampled.args[1]  # denoised_output
+        chunks: list[torch.Tensor] = []          # stitched contributions
+        prev_frames: torch.Tensor | None = None  # full frames of previous chunk's contribution
+        offset: int = 0
 
-            images = vae.decode(denoised["samples"])
-            if images.ndim == 5:
-                images = images.reshape(-1, *images.shape[-3:])
+        comfy.utils.PROGRESS_BAR_HOOK = remapped_hook
+        try:
+            for i, length in enumerate(lengths):
+                comfy.model_management.throw_exception_if_processing_interrupted()
+                chunk_base = i * steps_per_chunk
+                seed: int = noise_seed + i if seed_mode == "increment" else noise_seed
 
-            if i == 0:
-                contrib = images
-            else:
-                contrib = images[overlap:]
-                if color_transfer and prev_frames is not None:
-                    contrib = ColorTransfer.execute(
-                        image_target=contrib,
-                        image_ref=prev_frames[-1:],
-                        method="reinhard_lab",
-                        source_stats={"source_stats": "per_frame"},
-                        strength=1.0,
-                    ).args[0]
+                cond = WanSCAILToVideo.execute(
+                    positive=positive, negative=negative, vae=vae,
+                    width=width, height=height, length=length, batch_size=1,
+                    pose_strength=pose_strength, pose_start=pose_start, pose_end=pose_end,
+                    video_frame_offset=offset, previous_frame_count=overlap,
+                    replacement_mode=replacement_mode,
+                    reference_image=reference_image,
+                    clip_vision_output=clip_vision_output,
+                    pose_video=pose_video, pose_video_mask=pose_video_mask,
+                    reference_image_mask=reference_image_mask,
+                    previous_frames=prev_frames,
+                )
 
-            chunks.append(contrib)
-            prev_frames = contrib
-            pbar.update(1)
-            print(f"[SCAIL Auto Extend] chunk {i + 1}/{len(lengths)} done "
-                  f"({length} frames, offset now {offset})")
+                pos_c: list
+                neg_c: list
+                latent: dict
+                pos_c, neg_c, latent, offset = cond.args
 
-        out = torch.cat([c.to(chunks[0].device, dtype=chunks[0].dtype) for c in chunks], dim=0)
+                sampled = SamplerCustom.execute(
+                    model=model, add_noise=add_noise, noise_seed=seed, cfg=cfg,
+                    positive=pos_c, negative=neg_c, sampler=sampler, sigmas=sigmas,
+                    latent_image=latent,
+                )
+                denoised: dict = sampled.args[1]  # denoised_output
+
+                images: torch.Tensor = vae.decode(denoised["samples"])
+                if images.ndim == 5:
+                    images = images.reshape(-1, *images.shape[-3:])
+
+                contrib: torch.Tensor
+                if i == 0:
+                    contrib = images
+                else:
+                    contrib = images[overlap:]
+                    if color_transfer and prev_frames is not None:
+                        contrib = ColorTransfer.execute(
+                            image_target=contrib,
+                            image_ref=prev_frames[-1:],
+                            method="reinhard_lab",
+                            source_stats={"source_stats": "per_frame"},
+                            strength=1.0,
+                        ).args[0]
+
+                chunks.append(contrib)
+                prev_frames = contrib
+
+                # Snap the bar to this chunk's end so completion reads cleanly even
+                # if the sampler's last step rounds short.
+                if original_hook is not None:
+                    original_hook(min((i + 1) * steps_per_chunk, total_steps), total_steps, None)
+
+                print(
+                    f"[SCAIL Auto Extend] chunk {i + 1}/{len(lengths)} done "
+                    f"({length} frames, offset now {offset}) -- "
+                    f"{i + 1}/{len(lengths)} chunks "
+                    f"({(i + 1) / len(lengths) * 100:.1f}%)"
+                )
+        finally:
+            comfy.utils.PROGRESS_BAR_HOOK = original_hook
+
+        out: torch.Tensor = torch.cat(
+            [c.to(chunks[0].device, dtype=chunks[0].dtype) for c in chunks], dim=0
+        )
         return (out, out.shape[0])
 
 
@@ -202,16 +264,18 @@ class SCAIL2IdentitySeeder:
         return {
             "required": {
                 "model": ("MODEL", {"tooltip": "SAM3 model (same one feeding SAM3_VideoTrack)."}),
-                "image": ("IMAGE", {"tooltip": "Frame to segment, at the resolution the tracker runs on (resized reference image, or pose video's first frame)."}),
+                "image": ("IMAGE", {
+                    "tooltip": "Frame to segment, at the resolution the tracker runs on (resized reference image, or pose video's first frame)."}),
                 "mode": (["points", "boxes"], {"default": "points",
-                          "tooltip": "points: one positive click per person (from a PointsEditor). boxes: one bounding box per person."}),
+                                               "tooltip": "points: one positive click per person (from a PointsEditor). boxes: one bounding box per person."}),
                 "refine_iterations": ("INT", {"default": 2, "min": 0, "max": 5,
-                                      "tooltip": "SAM decoder refinement passes per object (0 = raw prompt mask)."}),
+                                              "tooltip": "SAM decoder refinement passes per object (0 = raw prompt mask)."}),
             },
             "optional": {
                 "points": ("STRING", {"default": "", "multiline": True,
-                            "tooltip": "points mode: JSON list, one positive point per person, e.g. [{\"x\":120,\"y\":210},{\"x\":480,\"y\":205}]. Order sets identity order."}),
-                "bboxes": ("BOUNDING_BOX", {"tooltip": "boxes mode: one bounding box per person. Order sets identity order."}),
+                                      "tooltip": "points mode: JSON list, one positive point per person, e.g. [{\"x\":120,\"y\":210},{\"x\":480,\"y\":205}]. Order sets identity order."}),
+                "bboxes": ("BOUNDING_BOX",
+                           {"tooltip": "boxes mode: one bounding box per person. Order sets identity order."}),
             },
         }
 
@@ -328,22 +392,26 @@ class SCAIL2IdentityTracker:
         return {
             "required": {
                 "sam3_model": ("MODEL", {"tooltip": "SAM3 model (e.g. from CheckpointLoaderSimple)."}),
-                "reference_image": ("IMAGE", {"tooltip": "Processed reference (post background-removal + padding), at model resolution."}),
-                "pose_video": ("IMAGE", {"tooltip": "Driving/pose video frames, at the resolution fed to the sampler."}),
+                "reference_image": ("IMAGE", {
+                    "tooltip": "Processed reference (post background-removal + padding), at model resolution."}),
+                "pose_video": ("IMAGE",
+                               {"tooltip": "Driving/pose video frames, at the resolution fed to the sampler."}),
                 "refine_iterations": ("INT", {"default": 2, "min": 0, "max": 5,
-                                      "tooltip": "SAM decoder refinement passes per seed."}),
+                                              "tooltip": "SAM decoder refinement passes per seed."}),
                 "auto_detect": ("BOOLEAN", {"default": True,
-                                "tooltip": "Master switch for text detection. When on, reference_conditioning / driving_conditioning (if connected) drive SAM3 text detection on that side, alongside any drawn boxes."}),
+                                            "tooltip": "Master switch for text detection. When on, reference_conditioning / driving_conditioning (if connected) drive SAM3 text detection on that side, alongside any drawn boxes."}),
                 "detection_threshold": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.01,
-                                        "tooltip": "Score threshold for auto-detected latecomers."}),
+                                                  "tooltip": "Score threshold for auto-detected latecomers."}),
                 "detect_interval": ("INT", {"default": 1, "min": 1, "max": 64,
-                                    "tooltip": "Run auto-detection every N frames."}),
+                                            "tooltip": "Run auto-detection every N frames."}),
                 "markers": ("STRING", {"default": "{}", "multiline": True,
-                            "tooltip": "Canvas markers (JSON). Managed by the node's canvas widget."}),
+                                       "tooltip": "Canvas markers (JSON). Managed by the node's canvas widget."}),
             },
             "optional": {
-                "reference_conditioning": ("CONDITIONING", {"tooltip": "Optional CLIPTextEncode (e.g. 'person') to auto-detect identities on the reference image instead of / alongside drawn boxes. Needs auto_detect on. Text-only loses explicit colour ordering."}),
-                "driving_conditioning": ("CONDITIONING", {"tooltip": "Optional CLIPTextEncode to auto-detect / append people on the driving video. Needs auto_detect on."}),
+                "reference_conditioning": ("CONDITIONING", {
+                    "tooltip": "Optional CLIPTextEncode (e.g. 'person') to auto-detect identities on the reference image instead of / alongside drawn boxes. Needs auto_detect on. Text-only loses explicit colour ordering."}),
+                "driving_conditioning": ("CONDITIONING", {
+                    "tooltip": "Optional CLIPTextEncode to auto-detect / append people on the driving video. Needs auto_detect on."}),
             },
         }
 
@@ -394,8 +462,8 @@ class SCAIL2IdentityTracker:
         }
 
         has_text = auto_detect and (
-            (reference_conditioning is not None and len(reference_conditioning) > 0)
-            or (driving_conditioning is not None and len(driving_conditioning) > 0))
+                (reference_conditioning is not None and len(reference_conditioning) > 0)
+                or (driving_conditioning is not None and len(driving_conditioning) > 0))
         # No markers and no text prompts -> play-button preview pass. Emit frames, skip tracking.
         if not ref_markers and not drv_markers and not has_text:
             ref_td = self._empty_track(reference_image.shape[0], reference_image.shape[1], reference_image.shape[2])
@@ -415,6 +483,7 @@ class SCAIL2IdentityTracker:
                 return None
             from comfy_extras.nodes_sam3 import _extract_text_prompts
             return [(emb, m) for emb, m, _ in _extract_text_prompts(cond, device, dtype)]
+
         ref_text = _text(reference_conditioning)
         drv_text = _text(driving_conditioning)
 
@@ -477,8 +546,10 @@ class SCAIL2MultiReference:
     def INPUT_TYPES(cls):
         optional = {}
         for i in range(1, 7):
-            optional[f"image_{i}"] = ("IMAGE", {"tooltip": f"Single character -> palette colour {i - 1}. Order must match the driving colours."})
-            optional[f"mask_{i}"] = ("MASK", {"tooltip": f"Silhouette for image_{i} (e.g. RMBG mask). Optional; defaults to the whole frame."})
+            optional[f"image_{i}"] = ("IMAGE", {
+                "tooltip": f"Single character -> palette colour {i - 1}. Order must match the driving colours."})
+            optional[f"mask_{i}"] = ("MASK", {
+                "tooltip": f"Silhouette for image_{i} (e.g. RMBG mask). Optional; defaults to the whole frame."})
         return {
             "required": {
                 "positive": ("CONDITIONING",),
@@ -487,9 +558,9 @@ class SCAIL2MultiReference:
                 "width": ("INT", {"default": 512, "min": 32, "max": 8192, "step": 32}),
                 "height": ("INT", {"default": 896, "min": 32, "max": 8192, "step": 32}),
                 "length": ("INT", {"default": 81, "min": 1, "max": 1024, "step": 4,
-                           "tooltip": "Generation length in frames. Must match the WanSCAILToVideo length."}),
+                                   "tooltip": "Generation length in frames. Must match the WanSCAILToVideo length."}),
                 "replacement_mode": ("BOOLEAN", {"default": True,
-                                     "tooltip": "Must match WanSCAILToVideo. Replacement composites each ref on black; animation uses the full frame."}),
+                                                 "tooltip": "Must match WanSCAILToVideo. Replacement composites each ref on black; animation uses the full frame."}),
             },
             "optional": optional,
         }
@@ -523,21 +594,24 @@ class SCAIL2MultiReference:
                 ref_img = image
             ref_latents.append(vae.encode(ref_img[:, :, :, :3]))  # [1,16,1,h,w]
 
-            colour = torch.tensor(DEFAULT_PALETTE[idx % len(DEFAULT_PALETTE)], device=image.device, dtype=image.dtype).view(1, 1, 1, 3)
+            colour = torch.tensor(DEFAULT_PALETTE[idx % len(DEFAULT_PALETTE)], device=image.device,
+                                  dtype=image.dtype).view(1, 1, 1, 3)
             bg = 0.0 if replacement_mode else 1.0
             char_sel = (m3 > 0.5).to(image.dtype)
             colour_img = char_sel * colour + (1.0 - char_sel) * bg  # [1,H,W,3]
             colour_masks.append(_extract_mask_to_28ch(colour_img))  # [1,1,28,h',w']
 
-        reference_latent = torch.cat(ref_latents, dim=2)        # [1,16,N,h,w]
-        ref_colour = torch.cat(colour_masks, dim=1)             # [1,N,28,h',w']
+        reference_latent = torch.cat(ref_latents, dim=2)  # [1,16,N,h,w]
+        ref_colour = torch.cat(colour_masks, dim=1)  # [1,N,28,h',w']
         lat_t = ((length - 1) // 4) + 1
         zeros = torch.zeros((1, lat_t, 28, ref_colour.shape[-2], ref_colour.shape[-1]),
                             device=ref_colour.device, dtype=ref_colour.dtype)
-        ref_mask_28ch = torch.cat([ref_colour, zeros], dim=1)   # [1, N+lat_t, 28, h',w']
+        ref_mask_28ch = torch.cat([ref_colour, zeros], dim=1)  # [1, N+lat_t, 28, h',w']
 
-        positive = node_helpers.conditioning_set_values(positive, {"reference_latents": [reference_latent]}, append=True)
-        negative = node_helpers.conditioning_set_values(negative, {"reference_latents": [reference_latent]}, append=True)
+        positive = node_helpers.conditioning_set_values(positive, {"reference_latents": [reference_latent]},
+                                                        append=True)
+        negative = node_helpers.conditioning_set_values(negative, {"reference_latents": [reference_latent]},
+                                                        append=True)
         positive = node_helpers.conditioning_set_values(positive, {"ref_mask_28ch": ref_mask_28ch})
         negative = node_helpers.conditioning_set_values(negative, {"ref_mask_28ch": ref_mask_28ch})
         return (positive, negative)
